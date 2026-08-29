@@ -76,15 +76,19 @@ pub fn transform(opts: Options) -> Result<SplitWasm> {
         read::Strictness::Lenient
     };
     // (1) parse input
+    let phase_start = std::time::Instant::now();
     let module = crate::read::InputModule::parse(opts.input_wasm, strictness)?;
+    tracing::debug!(elapsed = ?phase_start.elapsed(), "parsed input module");
     if opts.verbose {
         module.reloc_info.print_relocs();
     }
     // (2) dependency analysis and decide on splits
+    let phase_start = std::time::Instant::now();
     let deps = dep_graph::get_dependencies(&module)?;
     let split_points = split_point::get_split_points(&module)?;
     let split_program_info =
         split_point::compute_split_modules(&module, &deps.graph, split_points)?;
+    tracing::debug!(elapsed = ?phase_start.elapsed(), "computed dependency graph and split modules");
 
     if split_point::trace_enabled(opts.verbose) {
         for (name, split_deps) in split_program_info.output_modules.iter() {
@@ -93,6 +97,7 @@ pub fn transform(opts: Options) -> Result<SplitWasm> {
     }
     // (3) compute output modules and helper javascript
     let link_module = opts.link_name;
+    let phase_start = std::time::Instant::now();
     let emit_state = emit::EmitState::new(
         &opts,
         &module,
@@ -100,6 +105,8 @@ pub fn transform(opts: Options) -> Result<SplitWasm> {
         link_module,
         &deps.stub_fns,
     )?;
+    tracing::debug!(elapsed = ?phase_start.elapsed(), "prepared emit state");
+    let phase_start = std::time::Instant::now();
     let wasm_modules = emit::emit_modules(
         &split_program_info,
         &emit_state,
@@ -113,6 +120,8 @@ pub fn transform(opts: Options) -> Result<SplitWasm> {
             (identifier, output_path, data)
         },
     )?;
+    tracing::debug!(elapsed = ?phase_start.elapsed(), "encoded output modules");
+    let phase_start = std::time::Instant::now();
     let js_link_module = js::link_module(opts.main_module, &split_program_info, &emit_state)?;
     // (4) write the output
     std::fs::create_dir_all(opts.output_dir)?;
@@ -125,6 +134,7 @@ pub fn transform(opts: Options) -> Result<SplitWasm> {
             split_modules.push(output_path);
         }
     }
+    tracing::debug!(elapsed = ?phase_start.elapsed(), "wrote output modules and linked javascript");
     let prefetch_map = js_link_module.emit(&opts.output_dir.join(Path::new(link_module)))?;
 
     Ok(SplitWasm {
