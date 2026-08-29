@@ -63,6 +63,9 @@ version = "0.6"
 [dependencies.lazy_static]
 version = "1.4"
 
+[dependencies.rayon]
+version = "1"
+
 [dependencies.regex]
 version = "1.12"
 
