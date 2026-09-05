@@ -221,21 +221,33 @@ fn get_main_module_roots(module: &InputModule, split_points: &[SplitPoint]) -> H
     roots
 }
 
+/// The imports a wasm-bindgen `wbg_cast` descriptor function calls to mark itself:
+/// `__wbindgen_describe_cast` up to wasm-bindgen 0.2.127, and
+/// `__wbindgen_describe_generic_import` from 0.2.128 on, where casts became one case of
+/// per-monomorphisation generic imports (wasm-bindgen/wasm-bindgen#5230).
+const WBG_DESCRIPTOR_MARKERS: [&str; 2] = [
+    "__wbindgen_describe_cast",
+    "__wbindgen_describe_generic_import",
+];
+
 fn wbg_rooting_funs(_dep_graph: &DepGraph, module: &InputModule) -> HashSet<DepNode> {
     // [wasm-bindgen hack]
-    // wasm_bindgen specific hack: we root all functions calling `__wbindgen_describe_cast`.
-    // this is explained best with reference to the implementation in
+    // wasm_bindgen specific hack: we root all functions calling a descriptor marker import
+    // (`WBG_DESCRIPTOR_MARKERS`). this is explained best with reference to the implementation in
     // https://github.com/wasm-bindgen/wasm-bindgen/blob/8ea6a42f2491ecb53ca08c44399df6ad59caf871/src/rt/mod.rs#L30
     // a non-inline function describes the incoming and outgoing types.
     // since it is generic (to allow later monomorphization), this function can not be exported.
     // calls to this function are then later rewritten by wasm-bindgen to the inserted import.
+    // A caller left in a split module is never rewritten, and the marker import itself becomes
+    // a shared dependency whose local shim in the main module wasm-bindgen then interprets as
+    // an empty descriptor and panics on.
     let mut users_must_be_in_main = HashSet::new();
     let mut _wbg_describe_cast = None;
     for (import_id, import) in module.imports.iter().enumerate() {
         if import.module != "__wbindgen_placeholder__" || !matches!(import.ty, TypeRef::Func(_)) {
             continue;
         }
-        if import.name == "__wbindgen_describe_cast" {
+        if WBG_DESCRIPTOR_MARKERS.contains(&import.name) {
             let func_id = module.imported_func_map.get(&import_id).cloned().unwrap();
             _wbg_describe_cast = Some(func_id);
             users_must_be_in_main.insert(DepNode::Function(func_id));
@@ -247,7 +259,7 @@ fn wbg_rooting_funs(_dep_graph: &DepGraph, module: &InputModule) -> HashSet<DepN
     // wasm-bindgen currently replaces instructions, converting i32 to externref when calling an "adapter"
     // these must end up in the main module.
 
-    // Note: callers to `__wbindgen_describe_cast` will also get replaced with imports and are then
+    // Note: callers to a descriptor marker will also get replaced with imports and are then
     // subject to further processing via the described externref pass.
 
     // TODO: iterating the whole dep graph seems excessive
@@ -593,4 +605,64 @@ pub fn compute_split_modules(
     program_info.canary_export_name = format!("__canary_{:x}", hasher.finish());
 
     Ok(program_info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wasmparser::Import;
+
+    /// `(module, name)` of each import; import `i` is function `i`.
+    const IMPORTS: &[(&str, &str)] = &[
+        ("__wbindgen_placeholder__", "__wbindgen_describe"),
+        ("__wbindgen_placeholder__", "__wbindgen_describe_cast"),
+        (
+            "__wbindgen_placeholder__",
+            "__wbindgen_describe_generic_import",
+        ),
+        ("env", "__wbindgen_describe_generic_import"),
+    ];
+
+    fn module_importing(names: &'static [(&'static str, &'static str)]) -> InputModule<'static> {
+        InputModule {
+            imports: names
+                .iter()
+                .map(|&(module, name)| Import {
+                    module,
+                    name,
+                    ty: TypeRef::Func(0),
+                })
+                .collect(),
+            imported_func_map: (0..names.len()).map(|id| (id, id)).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// wasm-bindgen 0.2.128 renamed the `wbg_cast` descriptor marker; callers of
+    /// either spelling must be rooted in the main module.
+    #[test]
+    fn roots_every_wasm_bindgen_descriptor_marker() {
+        let module = module_importing(IMPORTS);
+        let roots = wbg_rooting_funs(&DepGraph::new(), &module);
+        for marker in WBG_DESCRIPTOR_MARKERS {
+            let marker_func = IMPORTS
+                .iter()
+                .position(|&import| import == ("__wbindgen_placeholder__", marker))
+                .unwrap();
+            assert!(
+                roots.contains(&DepNode::Function(marker_func)),
+                "{marker} is not rooted: {roots:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn roots_only_wasm_bindgen_descriptor_markers() {
+        let module = module_importing(IMPORTS);
+        let roots = wbg_rooting_funs(&DepGraph::new(), &module);
+        assert_eq!(
+            roots,
+            HashSet::from([DepNode::Function(1), DepNode::Function(2)])
+        );
+    }
 }
